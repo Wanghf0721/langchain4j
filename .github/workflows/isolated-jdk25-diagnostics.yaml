@@ -1,0 +1,140 @@
+name: Isolated JDK 25 diagnostics
+on:
+  push:
+    branches: ['diagnostics/jdk25-pgvector-anthropic-20261012']
+    paths: ['.github/workflows/isolated-jdk25-diagnostics.yaml']
+permissions:
+  contents: read
+env:
+  LC4J_GLOBAL_TEST_RETRY_ENABLED: 'false'
+jobs:
+  compare:
+    if: github.repository == 'Wanghf0721/langchain4j'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - label: baseline
+            ref: 872eca4b97b85a42f8409d0437ed4fc1994157b5
+          - label: fixed
+            ref: 73eb37ac7b07aed2d6993408de920688bfecba65
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ matrix.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact source and preinstalled Java 25
+        id: runtime
+        env:
+          EXPECTED_REF: ${{ matrix.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_REF"
+          test -n "${JAVA_HOME_25_X64:-}"
+          test -x "$JAVA_HOME_25_X64/bin/java"
+          export JAVA_HOME="$JAVA_HOME_25_X64"
+          export PATH="$JAVA_HOME/bin:$PATH"
+          java -XshowSettings:properties -version 2>&1 | tee runtime.txt
+          grep -Eq 'java.specification.version = 25$' runtime.txt
+          javac -version
+          ./mvnw -version
+          echo "JAVA_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME/bin" >> "$GITHUB_PATH"
+          echo "### ${{ matrix.label }}: $EXPECTED_REF" >> "$GITHUB_STEP_SUMMARY"
+          echo 'Using runner-preinstalled JDK; no JDK installation or fallback.' >> "$GITHUB_STEP_SUMMARY"
+          cat runtime.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Pgvector unit suite on unchanged source
+        id: pgvector
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./mvnw -B -ntp -pl langchain4j-pgvector -am -DembeddingsSkipDownload -Dtest=JSONBMetadataHandlerTest,MetadataColumDefinitionTest,PgVectorEmbeddingStoreBuilderTest,PgVectorEmbeddingStoreConnectionTest,PgVectorEmbeddingStoreContractTest,PgVectorEmbeddingStoreNoConnectionRequiredTest,PgVectorFilterMapperTest,SecretMaskingTest -Dsurefire.failIfNoSpecifiedTests=false -Dsurefire.rerunFailingTestsCount=0 -Dspotless.skip=true -Dcheckstyle.skip=true -Dmaven.javadoc.skip=true test 2>&1 | tee pgvector.log
+          python3 - <<'PY'
+          import glob,os,xml.etree.ElementTree as E
+          counts=dict(tests=0,failures=0,errors=0,skipped=0)
+          for path in glob.glob('langchain4j-pgvector/target/surefire-reports/TEST-*.xml'):
+              r=E.parse(path).getroot()
+              for k in counts: counts[k]+=int(r.get(k,0))
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f: f.write('\n### Unchanged-source pgvector suite\n'+str(counts)+'\n')
+          assert counts['tests']>0 and counts['failures']==counts['errors']==0, counts
+          PY
+      - name: Repeat exact Anthropic cancellation class five times
+        id: anthropic
+        if: always() && steps.runtime.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          failed=0
+          for attempt in 1 2 3 4 5; do
+            rm -f langchain4j-anthropic/target/surefire-reports/TEST-*PublisherCancellationTest.xml
+            ./mvnw -B -ntp -pl langchain4j-anthropic -am -DembeddingsSkipDownload -Dtest=AnthropicStreamingChatModelPublisherCancellationTest -Dsurefire.failIfNoSpecifiedTests=false -Dsurefire.rerunFailingTestsCount=0 -Dspotless.skip=true -Dcheckstyle.skip=true -Dmaven.javadoc.skip=true test 2>&1 | tee "anthropic-$attempt.log"
+            result=${PIPESTATUS[0]}
+            echo "### Anthropic attempt $attempt: Maven exit $result" >> "$GITHUB_STEP_SUMMARY"
+            report=langchain4j-anthropic/target/surefire-reports/TEST-dev.langchain4j.model.anthropic.AnthropicStreamingChatModelPublisherCancellationTest.xml
+            if test -f "$report"; then
+              cp "$report" "anthropic-$attempt.xml"
+              python3 - "$report" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import sys,xml.etree.ElementTree as E
+          r=E.parse(sys.argv[1]).getroot()
+          print({k:r.get(k) for k in ['tests','failures','errors','skipped','time']})
+          for t in r.findall('testcase'):
+              for f in list(t.findall('failure'))+list(t.findall('error')):
+                  print(t.get('name'),f.get('message'))
+          for p in r.findall('./properties/property'):
+              if p.get('name') in ('java.runtime.version','java.home'):
+                  print(p.get('name'),p.get('value'))
+          PY
+            else
+              echo 'ERROR: no test report; this attempt did not establish test execution.' >> "$GITHUB_STEP_SUMMARY"
+              failed=1
+              break
+            fi
+            if test "$result" -ne 0; then failed=1; fi
+          done
+          exit "$failed"
+      - name: Same pgvector regression tests against baseline and fixed production
+        id: regression
+        if: always() && steps.runtime.outcome == 'success'
+        continue-on-error: true
+        env:
+          VARIANT: ${{ matrix.label }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          testfile=langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/JSONBMetadataHandlerTest.java
+          git show 73eb37ac7b07aed2d6993408de920688bfecba65:"$testfile" > "$testfile"
+          rm -f langchain4j-pgvector/target/surefire-reports/TEST-dev.langchain4j.store.embedding.pgvector.JSONBMetadataHandlerTest.xml
+          ./mvnw -B -ntp -pl langchain4j-pgvector -am -DembeddingsSkipDownload -Dtest=JSONBMetadataHandlerTest -Dsurefire.failIfNoSpecifiedTests=false -Dsurefire.rerunFailingTestsCount=0 -Dspotless.skip=true -Dcheckstyle.skip=true -Dmaven.javadoc.skip=true test 2>&1 | tee regression.log
+          result=${PIPESTATUS[0]}
+          export MAVEN_RESULT="$result"
+          python3 - <<'PY'
+          import os,xml.etree.ElementTree as E
+          r=E.parse('langchain4j-pgvector/target/surefire-reports/TEST-dev.langchain4j.store.embedding.pgvector.JSONBMetadataHandlerTest.xml').getroot()
+          counts={k:int(r.get(k,0)) for k in ['tests','failures','errors','skipped']}
+          expected_failures=5 if os.environ['VARIANT']=='baseline' else 0
+          expected_exit_nonzero=expected_failures>0
+          ok=counts==dict(tests=8,failures=expected_failures,errors=0,skipped=0) and ((int(os.environ['MAVEN_RESULT'])!=0)==expected_exit_nonzero)
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
+              f.write('\n### Same-test red/green comparison\n')
+              f.write(f"{counts}; expected failures: {expected_failures}; expectation satisfied: {ok}\n")
+              f.write('Baseline expected assertion failures are diagnostic success only, not a claim the baseline tests passed.\n')
+          raise SystemExit(0 if ok else 1)
+          PY
+      - name: Final diagnostic verdict
+        if: always()
+        env:
+          RUNTIME: ${{ steps.runtime.outcome }}
+          PGVECTOR: ${{ steps.pgvector.outcome }}
+          ANTHROPIC: ${{ steps.anthropic.outcome }}
+          REGRESSION: ${{ steps.regression.outcome }}
+        shell: bash
+        run: |
+          echo "Runtime=$RUNTIME; original-source pgvector suite=$PGVECTOR; Anthropic repeats=$ANTHROPIC; expected red/green=$REGRESSION" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$RUNTIME" = success && test "$PGVECTOR" = success && test "$ANTHROPIC" = success && test "$REGRESSION" = success
