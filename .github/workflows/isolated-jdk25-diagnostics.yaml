@@ -70,6 +70,7 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
+          set +e
           set -uo pipefail
           failed=0
           for attempt in 1 2 3 4 5; do
@@ -107,6 +108,7 @@ jobs:
           VARIANT: ${{ matrix.label }}
         shell: bash
         run: |
+          set +e
           set -uo pipefail
           testfile=langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/JSONBMetadataHandlerTest.java
           git show 73eb37ac7b07aed2d6993408de920688bfecba65:"$testfile" > "$testfile"
